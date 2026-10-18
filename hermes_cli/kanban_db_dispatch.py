@@ -296,7 +296,9 @@ def _worker_log_reclaimed_before_start(task_id: str, pid: int, board: Optional[s
     """
     try:
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
+    except OSError:
+        # A filesystem hiccup must not kill the sweep; an unreadable log simply
+        # cannot confirm the marker (the death then falls through to normal rules).
         return False
     return any(int(m) == int(pid) for m in _RECLAIMED_EXIT_TRAILER_RE.findall(raw or ""))
 
