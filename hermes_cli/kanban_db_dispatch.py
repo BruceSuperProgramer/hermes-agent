@@ -71,6 +71,21 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Run outcomes whose own failure wrote ``last_failure_error`` as a diagnosis
+# (spawn diagnostics, timeout / gave-up errors). The stamped text counts for
+# ``blocker_auth`` only while the LATEST ended run is one of these — or no run
+# exists to contradict it (fail closed, the pre-run history). A later success
+# terminal (completed / review_requested / changes_requested) supersedes the
+# stamp (#119070): ``request_review`` and ``request_changes`` end their run
+# without clearing ``last_failure_error``, so a stale quota text from an
+# earlier rate-limit requeue would otherwise park the review handoff forever.
+# Not in the set, deliberately: ``crashed`` stays exempt (#117097 — its
+# persisted error mixes in the worker's last captured output, context rather
+# than a diagnosis); ``rate_limited`` never reaches the check (the cooldown
+# section returns above); ``reclaimed_before_start`` is a neutral requeue that
+# writes no failure of its own (t_e5175316).
+_RESPAWN_BLOCKER_AUTH_OUTCOMES = frozenset({"spawn_failed", "timed_out", "gave_up"})
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1649,7 +1664,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern stamped by the latest ended run's own failure — a later
+    success terminal such as a review handoff lifts the stale stamp, #119070;
+    the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1697,13 +1714,19 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Quota / auth blocker: retrying immediately will not help.  The stamp
+    #    is trusted only while the LATEST ended run is itself the failure that
+    #    wrote it (or no run contradicts it — fail closed): a success terminal
+    #    such as a review handoff ends its run without clearing the stamp, so
+    #    the stale text must not park the next spawn (#119070).  A plain crash
+    #    is different: its persisted error includes the worker's last
+    #    captured output, which is context rather than a diagnosis and may contain
+    #    benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (err
+            and (latest_outcome is None or latest_outcome in _RESPAWN_BLOCKER_AUTH_OUTCOMES)
+            and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
