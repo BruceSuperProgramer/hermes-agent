@@ -267,3 +267,48 @@ def test_migration_backfills_hold_for_escalated_triage_cards(tmp_path, monkeypat
         assert task.status == "triage" and task.recovery_hold == 1
         fresh = kb.create_task(conn, title="fresh plan", assignee="worker", triage=True)
         assert kb.get_task(conn, fresh).recovery_hold == 0
+
+
+def test_backfill_negative_specified_after_escalation_stays_unheld(tmp_path, monkeypatch):
+    """A legacy card whose breaker escalation was ALREADY followed by a real
+    specification must NOT be re-armed by the backfill (whitelist branch)."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy2.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(kb, "_fire_task_hook", lambda *a, **kw: None)
+    kb.init_db(db_path)
+    with kbc.connect(db_path) as conn:
+        tid = _escalate(conn)
+    raw = sqlite3.connect(db_path)
+    raw.execute("ALTER TABLE tasks DROP COLUMN recovery_hold")
+    raw.commit()
+    # Simulate the OLD binary having re-specified the card after escalation:
+    # title rewrite + 'specified' event AFTER the block_loop_detected record.
+    raw.execute("UPDATE tasks SET title='rewritten by old specifier' WHERE id=?", (tid,))
+    raw.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'specified', NULL, strftime('%s','now'))",
+        (tid,))
+    raw.commit()
+    raw.close()
+    kb.init_db(db_path)
+    with kbc.connect(db_path) as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage" and task.recovery_hold == 0
+
+
+def test_recover_lands_review_when_that_is_where_it_left_off(board):
+    parent_free = kb.create_task(board, title="review-bound card", assignee="worker")
+    assert kb.claim_task(board, parent_free, claimer="fixture") is not None
+    assert kb.request_review(board, parent_free, summary="implemented") is True
+    assert kb.claim_review_task(board, parent_free, claimer="fixture") is not None
+    assert kb.block_task(board, parent_free, reason="blocked while in review", kind="needs_input")
+    assert kb.unblock_task(board, parent_free)
+    # A review-resumed card lands back in review (not ready), so the second
+    # cycle goes through the reviewer claim.
+    assert kb.claim_review_task(board, parent_free, claimer="fixture") is not None
+    assert kb.block_task(board, parent_free, reason="blocked again", kind="needs_input")
+    assert kb.get_task(board, parent_free).status == "triage"
+    ok, _ = kb.recover_task(board, parent_free, evidence="reviewer replied with approval", author="atlas")
+    assert ok is True
+    assert kb.get_task(board, parent_free).status == "review"

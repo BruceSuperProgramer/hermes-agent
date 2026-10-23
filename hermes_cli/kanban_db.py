@@ -2226,9 +2226,12 @@ def claim_task(
     with write_txn(conn):
         # Recovery-hold gate (in-txn, so it holds even when some writer flipped
         # the status around it): an unresolved breaker incident must never open
-        # a worker run, however the card reached ``ready``.
+        # a worker run, however the card reached ``ready``. Only a card that is
+        # actually claimable-but-held records the rejection; for any other
+        # status the CAS below would refuse anyway (no event noise).
         held = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1 AND status = 'ready'",
+            (task_id,),
         ).fetchone()
         if held:
             _append_event(conn, task_id, "claim_rejected", {"reason": "recovery_hold"})
@@ -2267,7 +2270,8 @@ def claim_review_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         held = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1 AND status = 'review'",
+            (task_id,),
         ).fetchone()
         if held:
             _append_event(conn, task_id, "claim_rejected", {"reason": "recovery_hold"})
@@ -3889,7 +3893,14 @@ def recover_task(
                 "ORDER BY id DESC LIMIT 1", (task_id,),
             ).fetchone()
             if prior and _json_dict(_row_get(prior, "payload")).get("idempotency_key") == key:
-                return True, "already recovered (idempotent replay)"
+                if not int(_row_get(row, "recovery_hold") or 0) and row["status"] != "triage":
+                    return True, "already recovered (idempotent replay)"
+                # The key matches an OLDER recovery but the card has since
+                # re-escalated under a fresh hold: reporting ok=True here would
+                # tell the caller "resumed" while the card is still stopped.
+                return False, (
+                    "idempotency key matches an earlier recovery; the card has "
+                    "re-escalated and needs a new evidence-backed recovery")
         if not int(_row_get(row, "recovery_hold") or 0) or row["status"] != "triage":
             return False, "no active recovery hold on this task"
         if not evidence:
@@ -3899,6 +3910,7 @@ def recover_task(
             landing = "review"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, recovery_hold = 0, block_recurrences = 0, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
             "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status = 'triage' AND recovery_hold = 1",

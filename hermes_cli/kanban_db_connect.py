@@ -941,17 +941,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             added = _add_column_if_missing(conn, "tasks", name, ddl)
             if added and legacy is not None and legacy in cols:
                 conn.execute(copy_sql)
-    had_recovery_hold = "recovery_hold" in cols
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
-    # One-shot backfill when the recovery-hold column first lands: a legacy
-    # triage card whose escalation evidence is still the newest lifecycle word
-    # is an unresolved breaker incident and must come up HELD, not as fresh
-    # planning material. Cards that were specified/decomposed/unblocked after
-    # their escalation keep hold=0 (their latest word is not the breaker's).
-    if not had_recovery_hold and _table_exists(conn, "task_events"):
+    # Recovery-hold backfill for legacy boards. Connections are autocommit
+    # (isolation_level=None), so the ALTER above and this UPDATE commit
+    # separately: a crash in between must NOT leave the backfill permanently
+    # skipped (the escalated triage card would come back up unheld and the
+    # 2026-10-23 reentry incident would replay). The backfill is idempotent —
+    # recovered cards are no longer ``triage`` and post-escalation
+    # specify/decompose/unblocked events keep a card unheld — so it runs on
+    # EVERY init, guarded by a cheap unheld-triage probe so boards without
+    # triage work pay only one small table scan.
+    if _table_exists(conn, "task_events") and conn.execute(
+        "SELECT 1 FROM tasks WHERE status = 'triage' AND recovery_hold = 0 LIMIT 1"
+    ).fetchone():
         conn.execute(
             "UPDATE tasks SET recovery_hold = 1 WHERE status = 'triage' AND NOT EXISTS ("
             "  SELECT 1 FROM task_events newer WHERE newer.task_id = tasks.id"
