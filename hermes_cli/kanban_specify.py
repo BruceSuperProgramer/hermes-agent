@@ -124,13 +124,19 @@ def _profile_author(default: str = "specifier") -> str:
 
 
 def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
-    """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
+    """``(task, "")`` when the task exists, is in triage and carries no active
+    recovery hold; else ``(None, reason)``."""
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         return None, "unknown task id"
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
+    if task.recovery_hold:
+        # Skip BEFORE spending the aux LLM call: a breaker-escalated card is an
+        # incident awaiting an explicit evidence-backed ``recover_task``, not a
+        # planning request (2026-10-23 reentry incident).
+        return None, "task has an active recovery hold; use an evidence-backed recovery"
     return task, ""
 
 
@@ -235,7 +241,13 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column; ``tenant`` narrows the sweep.
+
+    Excludes breaker-escalated cards (``recovery_hold``): those await an
+    explicit evidence-backed recovery, not automatic re-specification.
+    """
     with kbc.connect_closing() as conn:
-        tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
+        tasks = kb.list_tasks(
+            conn, status="triage", tenant=tenant, include_archived=False,
+            exclude_recovery_hold=True)
     return [t.id for t in tasks]

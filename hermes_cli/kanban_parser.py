@@ -332,6 +332,14 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("recover", [
+        _TASK_ID,
+        _arg("--evidence", help="Non-empty description of the NEW verified fact that justifies "
+                                "resuming (fix candidate, environment repair, ...). Required."),
+        _arg("--idempotency-key", help="Stable key making a replay of this recovery a no-op."),
+        _arg("--author", help="Override the recorded author (defaults to the active profile)."),
+    ], help="Clear a breaker-escalated card's recovery hold with evidence — the only "
+            "exit from a block-loop triage hold"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

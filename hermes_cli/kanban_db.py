@@ -664,6 +664,11 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    # Breaker-escalation stop gate: 1 while an unresolved block-loop incident
+    # holds the card (set by ``_route_block`` on the triage escalation; cleared
+    # ONLY by an explicit evidence-backed :func:`recover_task`). Blocks every
+    # automatic planning/specify/fanout/claim entry until cleared.
+    recovery_hold: int = 0
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -683,6 +688,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            recovery_hold=int(g("recovery_hold") or 0),
         )
 
 
@@ -901,7 +907,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Breaker-escalation stop gate (see the Task field comment). Set when a
+    -- same-kind block cycle routes the card to ``triage``; a migration backfill
+    -- also arms it for legacy cards whose latest lifecycle event is
+    -- ``block_loop_detected``. Cleared only by ``recover_task`` with evidence.
+    recovery_hold        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1451,6 +1462,7 @@ def list_tasks(
     tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
     limit: Optional[int] = None, order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+    exclude_recovery_hold: bool = False,
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -1464,6 +1476,10 @@ def list_tasks(
         if val is not None:
             query += f" AND {col} = ?"
             params.append(val)
+    if exclude_recovery_hold:
+        # Automatic sweeps must not see breaker-escalated cards: they are
+        # incidents awaiting explicit recovery, not planning requests.
+        query += " AND recovery_hold = 0"
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if order_by is not None:
@@ -2208,6 +2224,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Recovery-hold gate (in-txn, so it holds even when some writer flipped
+        # the status around it): an unresolved breaker incident must never open
+        # a worker run, however the card reached ``ready``.
+        held = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1", (task_id,)
+        ).fetchone()
+        if held:
+            _append_event(conn, task_id, "claim_rejected", {"reason": "recovery_hold"})
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2241,6 +2266,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        held = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND recovery_hold = 1", (task_id,)
+        ).fetchone()
+        if held:
+            _append_event(conn, task_id, "claim_rejected", {"reason": "recovery_hold"})
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -3261,7 +3292,14 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        # Arming the recovery hold is what makes the triage escalation STICK:
+        # without it the auto-decomposer reads ``triage`` as a fresh planning
+        # request and re-promotes the card every dispatch tick (2026-10-23
+        # reentry incident). The hold survives kind/title/reason churn and is
+        # cleared only by an explicit evidence-backed ``recover_task``.
+        return "triage", "block_loop_detected", \
+            "block_kind    = ?,\n                       block_recurrences = ?,\n                       recovery_hold = 1", \
+            (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3766,10 +3804,17 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, recovery_hold FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        if int(_row_get(existing, "recovery_hold") or 0):
+            # A breaker-escalated card is an incident awaiting an explicit
+            # evidence-backed recovery (``recover_task``), not a fresh planning
+            # request: retitling/rewriting must not resurrect it (2026-10-23
+            # reentry incident). In-txn check so a hold set while an aux LLM
+            # call was in flight is still honoured here.
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -3808,6 +3853,74 @@ def specify_triage_task(
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
     return True
+
+
+def recover_task(
+    conn: sqlite3.Connection, task_id: str, *, evidence: Optional[str] = None,
+    author: Optional[str] = None, idempotency_key: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Explicitly clear a breaker-escalated card's recovery hold.
+
+    This is the ONLY exit from ``recovery_hold``: title edits, comments, block
+    re-classifications and new runs never clear it. ``evidence`` must be a
+    non-empty description of the NEW verified fact that justifies resuming (a
+    fix candidate, an environment repair, ...); ``idempotency_key``, when
+    given, makes a replay of the same recovery grant a no-op instead of a
+    second transition. Returns ``(ok, reason)``.
+
+    Landing status re-gates on parents (``todo`` while any is open, else the
+    pre-breaker phase — ``review`` when that is where it left off) and resets
+    the unblock-loop counter: a recovery is a fresh start, and a NEW failure
+    after it simply re-arms a fresh hold (one recovery buys one execution
+    window).
+    """
+    evidence = (evidence or "").strip()
+    author = (author or "").strip() or None
+    key = (idempotency_key or "").strip() or None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, recovery_hold FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, "unknown task"
+        if key:
+            prior = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'recovery_granted' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if prior and _json_dict(_row_get(prior, "payload")).get("idempotency_key") == key:
+                return True, "already recovered (idempotent replay)"
+        if not int(_row_get(row, "recovery_hold") or 0) or row["status"] != "triage":
+            return False, "no active recovery hold on this task"
+        if not evidence:
+            return False, "recovery requires non-empty evidence describing the new verified fact"
+        landing = _landing_status_after_parents(conn, task_id)
+        if landing == "ready" and _resume_status_from_events(conn, task_id) == "review":
+            landing = "review"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, recovery_hold = 0, block_recurrences = 0, "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND status = 'triage' AND recovery_hold = 1",
+            (landing, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed concurrently; retry"
+        payload: dict[str, Any] = {"evidence": evidence, "new_status": landing}
+        if author:
+            payload["author"] = author
+        if key:
+            payload["idempotency_key"] = key
+        _append_event(conn, task_id, "recovery_granted", payload)
+        if author:
+            _insert_comment(
+                conn, task_id, author,
+                "Recovery granted — hold cleared with evidence: " + evidence,
+                int(time.time()),
+            )
+    recompute_ready(conn)
+    notify_task_updated(conn, task_id, ("status",))
+    return True, landing
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:

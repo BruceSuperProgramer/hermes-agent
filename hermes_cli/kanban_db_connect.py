@@ -887,6 +887,8 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Breaker-escalation stop gate (see kanban_db SCHEMA_SQL). 0 = no hold.
+    ("recovery_hold", "recovery_hold INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -939,9 +941,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             added = _add_column_if_missing(conn, "tasks", name, ddl)
             if added and legacy is not None and legacy in cols:
                 conn.execute(copy_sql)
+    had_recovery_hold = "recovery_hold" in cols
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
+
+    # One-shot backfill when the recovery-hold column first lands: a legacy
+    # triage card whose escalation evidence is still the newest lifecycle word
+    # is an unresolved breaker incident and must come up HELD, not as fresh
+    # planning material. Cards that were specified/decomposed/unblocked after
+    # their escalation keep hold=0 (their latest word is not the breaker's).
+    if not had_recovery_hold and _table_exists(conn, "task_events"):
+        conn.execute(
+            "UPDATE tasks SET recovery_hold = 1 WHERE status = 'triage' AND NOT EXISTS ("
+            "  SELECT 1 FROM task_events newer WHERE newer.task_id = tasks.id"
+            "     AND newer.id > (SELECT MAX(e2.id) FROM task_events e2"
+            "                      WHERE e2.task_id = tasks.id AND e2.kind = 'block_loop_detected')"
+            "     AND newer.kind IN ('specified', 'decomposed', 'unblocked', 'recovery_granted')"
+            ") AND EXISTS ("
+            "  SELECT 1 FROM task_events e WHERE e.task_id = tasks.id"
+            "     AND e.kind = 'block_loop_detected')"
+        )
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,

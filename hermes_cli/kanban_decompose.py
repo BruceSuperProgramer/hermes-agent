@@ -337,7 +337,14 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Breaker-escalated cards (``recovery_hold``) are excluded: they are
+    unresolved incidents awaiting an explicit evidence-backed recovery, not
+    new planning requests — feeding them to the decomposer re-promoted the
+    same failing card every dispatch tick (2026-10-23 reentry incident).
+    """
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+        rows = kb.list_tasks(
+            conn, status="triage", tenant=tenant, limit=1000, exclude_recovery_hold=True)
     return [row.id for row in rows]

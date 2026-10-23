@@ -51,6 +51,14 @@ def initial_task_state(
     return "ready", tenant
 
 
+def _row_get(row: sqlite3.Row, col: str, default: Any = None) -> Any:
+    """Tolerant row access (columns may be absent on legacy schemas)."""
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return default
+
+
 def _validate_children_graph(children: list) -> None:
     """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
     would deadlock every involved child in ``todo`` forever)."""
@@ -115,11 +123,27 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, recovery_hold "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        if int(_row_get(root_row, "recovery_hold") or 0):
+            # A breaker-escalated root is an unresolved incident: fanning it out
+            # would launder the hold into fresh child runs (2026-10-23 reentry
+            # incident). Only an explicit ``recover_task`` reopens planning.
+            return None
+        # Open EXTERNAL prerequisites of the root (every existing parent link
+        # predates the children we are about to create). The decomposed graph
+        # must stay contingent on them: without these links a root waiting on
+        # an upstream fix would shed that wait and its children would run
+        # immediately. done/archived prerequisites are not re-imposed.
+        open_external = conn.execute(
+            "SELECT l.parent_id FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')",
+            (task_id,),
+        ).fetchall()
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
         if conn.execute(
@@ -131,12 +155,19 @@ def decompose_triage_task(
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
             for child in children
         ]
-        # Sibling edges within the decomposed graph.
+        # Sibling edges within the decomposed graph, plus the root's open
+        # external prerequisites re-imposed onto every child.
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
                 _link(conn, parent_id, child_id)
                 _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+            for ext in open_external:
+                _link(conn, ext["parent_id"], child_ids[idx])
+                _append_event(
+                    conn, child_ids[idx], "linked",
+                    {"parent": ext["parent_id"], "child": child_ids[idx],
+                     "inherited_from_root": True})
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:

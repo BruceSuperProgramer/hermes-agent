@@ -1032,6 +1032,29 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Explicitly clear a breaker-escalated card's recovery hold (evidence-backed)."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban recover is coordinator/operator-only; workers must hand off their assigned task")
+    tid = args.task_id
+    evidence = _stripped_or_none(getattr(args, "evidence", None))
+    if not evidence:
+        return _err(
+            f"recovery requires --evidence: the NEW verified fact that justifies resuming {tid} "
+            "(title/body edits, comments and new runs are not recovery evidence)")
+    author = getattr(args, "author", None) or _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, reason = kb.recover_task(
+            conn, tid, evidence=evidence, author=author,
+            idempotency_key=getattr(args, "idempotency_key", None))
+        if not ok:
+            return _err(f"cannot recover {tid}: {reason}")
+        task = kb.get_task(conn, tid)
+        landed = task.status if task else "?"
+    print(f"Recovered {tid}: hold cleared, landed in {landed} (evidence recorded)")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1327,7 +1350,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "recover": _cmd_recover,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
