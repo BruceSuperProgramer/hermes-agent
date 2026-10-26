@@ -8,10 +8,14 @@ Alert conditions (per task):
   - running past its max_runtime_seconds
   - running with an expired claim
 Deduped through a small local state file; repeat alerts every REPEAT_SECS.
+Signatures are category-stable (embedded numbers collapsed) and the state is
+saved even when a send fails, so an unpaired/down channel backs off instead of
+retrying the identical alert every frame.
 """
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -121,7 +125,11 @@ def main():
     to_alert = []
     for s in stuck:
         prev = state.get(s["id"])
-        signature = s["status"] + "|" + s["reasons"]
+        # Reasons embed evolving values ("no heartbeat for 1234s") that change
+        # every frame, which defeated this dedup and re-alerted each cycle.
+        # Collapse digit runs so the signature encodes only the reason
+        # CATEGORY; a genuinely new category still differs and re-alerts.
+        signature = s["status"] + "|" + re.sub(r"\d+", "N", s["reasons"])
         if not prev or prev.get("sig") != signature or now - prev.get("ts", 0) > REPEAT_SECS:
             to_alert.append(s)
             state[s["id"]] = {"sig": signature, "ts": now}
@@ -136,8 +144,15 @@ def main():
     if len(to_alert) > MAX_ROWS:
         lines.append(f"(另有 {len(to_alert) - MAX_ROWS} 个，请查看 kanban)")
 
-    if send_weixin("\n".join(lines)):
-        save_state(state)
+    sent = send_weixin("\n".join(lines))
+    # Land the dedup state even when the send failed. Skipping the save used
+    # to leave the state file empty, so every launchd frame retried the same
+    # alert (11k+ "send failed" log lines while the Weixin channel sat
+    # unpaired). The saved ts is the backoff: retry no earlier than
+    # REPEAT_SECS; a changed reason category still alerts immediately.
+    if not sent:
+        print(f"alert send failed; dedup state saved anyway, backing off {REPEAT_SECS}s", file=sys.stderr)
+    save_state(state)
     return 0
 
 
