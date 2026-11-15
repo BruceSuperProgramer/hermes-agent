@@ -1785,11 +1785,10 @@ def add_attachment(
     now = int(time.time())
     with write_txn(conn):
         _require_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (task_id, filename.strip(), stored_path, content_type, int(size), uploaded_by, now),
+        from hermes_cli.kanban_db_attachments import insert_attachment
+        cur = insert_attachment(
+            conn, task_id, filename=filename.strip(), stored_path=stored_path,
+            content_type=content_type, size=int(size), uploaded_by=uploaded_by, created_at=now,
         )
         _append_event(
             conn, task_id, "attached",
@@ -3023,11 +3022,10 @@ def _insert_completion_attachment(
     created_at: int, uploaded_by: str = "kanban_complete",
 ) -> None:
     """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, ?, ?)",
-        (task_id, filename, stored_path, size, uploaded_by, created_at),
+    from hermes_cli.kanban_db_attachments import insert_attachment
+    insert_attachment(
+        conn, task_id, filename=filename, stored_path=stored_path,
+        content_type=None, size=size, uploaded_by=uploaded_by, created_at=created_at,
     )
     _append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": uploaded_by})
 
@@ -3745,8 +3743,9 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
-            (task_id,),
+            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage' "
+            "AND block_recurrences < ?",
+            (task_id, BLOCK_RECURRENCE_LIMIT),
         ).fetchone()
         if existing is None:
             return False
