@@ -131,6 +131,8 @@ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
         return None, "unknown task id"
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
+    if task.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
+        return None, "task needs failure recovery; unblock after resolving its recorded blocker"
     return task, ""
 
 
@@ -238,4 +240,4 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Task ids in the triage column; ``tenant`` narrows the sweep."""
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+    return [t.id for t in tasks if t.block_recurrences < kb.BLOCK_RECURRENCE_LIMIT]
